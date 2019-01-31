@@ -42,7 +42,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, {pid :: pid(), port :: port()}).
+-record(state, {dst :: pid()|term(), port :: port()}).
 
 -type time_unit() :: timestamp | microsecond.
 
@@ -52,9 +52,13 @@ start() ->
 -spec start(proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
 start(Options) ->
     start(self(), Options).
--spec start(pid(),proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start(pid()|{M::atom(),F::atom(),A::list()},proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
 start(Pid, Options) when is_pid(Pid), is_list(Options) ->
-    gen_server:start(?MODULE, [Pid, Options], []).
+    gen_server:start(?MODULE, [Pid, Options], []);
+start({M,F,A}, Options) when is_list(Options) ->
+    gen_server:start(?MODULE, [{M,F,A}, Options], []).
+
+
 
 -spec start_link() -> 'ignore' | {'error',_} | {'ok',pid()}.
 start_link() ->
@@ -62,9 +66,12 @@ start_link() ->
 -spec start_link(proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
 start_link(Options) ->
     start_link(self(), Options).
--spec start_link(pid(),proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
-start_link(Pid, Options) ->
-    gen_server:start_link(?MODULE, [Pid, Options], []).
+-spec start_link(pid()|{M::atom(),F::atom(),A::list()},proplists:proplist()) -> 'ignore' | {'error',_} | {'ok',pid()}.
+start_link(Pid, Options) when is_pid(Pid) ->
+    gen_server:start_link(?MODULE, [Pid, Options], []);
+start_link({M,F,A}, Options) ->
+    gen_server:start_link(?MODULE, [{M,F,A}, Options], []).
+
 
 -spec send(pid(), iodata()) -> ok.
 send(Pid, Packet) when is_pid(Pid) ->
@@ -80,7 +87,7 @@ stop(Pid) ->
     catch gen_server:call(Pid, stop),
     ok.
 
-init([Pid, Options]) ->
+init([Dst, Options]) ->
     process_flag(trap_exit, true),
     Options1 = setopts([
             {chroot, filename:join([basedir(), "tmp"])},
@@ -91,13 +98,16 @@ init([Pid, Options]) ->
                 Options1
             ), ".")),
     Cmd = string:join(getopts(Options1), " "),
+    %% Cmd example
+    %% sudo taskset -c 0 /root/ss7track/lib/epcap-0.8.1/priv/epcap -t 0 -d /root/ss7track/lib/epcap-0.8.1/priv/tmp -i eth10 -e PCAP_PF_RING_CLUSTER_ID=1 -P \"sctp or (vlan and sctp)\""
+    %% TODO make tmp path more standart
     Port = open_port({spawn, Cmd}, [{packet, 2}, binary, exit_status]),
 
     % Block until the port has fully initialized
     receive
         {Port, {data, Data}} ->
             {epcap, ready} = binary_to_term(Data),
-            {ok, #state{pid = Pid, port = Port}};
+            {ok, #state{dst = Dst, port = Port}};
         {'EXIT', Port, normal} ->
             {stop, {error, port_init_failed}};
         {'EXIT', Port, Reason} ->
@@ -106,11 +116,9 @@ init([Pid, Options]) ->
 
 handle_call({send, Packet}, _From, #state{port = Port} = State) ->
     Reply = try erlang:port_command(Port, Packet) of
-        true ->
-            ok
+        true -> ok
         catch
-            error:badarg ->
-                {error,closed}
+            error:badarg -> {error,closed}
         end,
     {reply, Reply, State};
 
@@ -130,7 +138,11 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Port communication
 %%--------------------------------------------------------------------
-handle_info({Port, {data, Data}}, #state{port = Port, pid = Pid} = State) ->
+handle_info({Port, {data, Data}}, #state{port = Port, dst = {M,F,A}} = State) ->
+    Msg = #{src => pcap, bin => Data}, 
+    erlang:apply(M, F, [{msg, Msg}|A]),
+    {noreply, State};
+handle_info({Port, {data, Data}}, #state{port = Port, dst = Pid} = State) when is_pid(Pid) ->
     Pid ! binary_to_term(Data),
     {noreply, State};
 
